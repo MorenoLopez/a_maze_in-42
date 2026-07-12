@@ -1,0 +1,18 @@
+git a__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.venv/
+venv/
+env/
+ENV/
+dist/
+build/
+*.egg-info/
+*.egg
+maze.txt
