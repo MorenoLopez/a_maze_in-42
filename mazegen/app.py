@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+# ########################################################################### #
+#   shebang: 1                                                                #
+#                                                          :::      ::::::::  #
+#   app.py                                               :+:      :+:    :+:  #
+#                                                      +:+ +:+         +:+    #
+#   By: mandrini <mandrini@student.42antananarivo.   +#+  +:+       +#+       #
+#                                                  +#+#+#+#+#+   +#+          #
+#   Created: 2026/07/04 21:53:15 by mandrini            #+#    #+#            #
+#   Updated: 2026/07/04 21:53:17 by mandrini           ###   ########.fr      #
+#                                                                             #
+# ########################################################################### #
+
+"""MLX window: rendering, animations, and keyboard event handling."""
+
+import math
+import os
+from importlib.resources import files
+from typing import Any, Optional
+
+from .config import Config, die
+from .constants import (
+    EAST,
+    KEY_C,
+    KEY_ESCAPE,
+    KEY_P,
+    KEY_Q,
+    KEY_SPACE,
+    NORTH,
+    PALETTES,
+    SOUTH,
+    WEST,
+)
+from .generator import MazeGenerator
+from .renderer import (
+    draw_hline,
+    draw_vline,
+    fill_rect,
+    to_bytes,
+    to_int,
+    write_output,
+)
+from .solver import MazeSolver
+
+# Number of cells in the stack included in the glowing trail
+# behind the backtracker's head (generation animation).
+TRAIL_LEN: int = 80
+
+# Warm tint applied when the stack is deep (long-running exploration).
+_WARM: tuple[int, int, int] = (255, 0, 0)
+
+# Speed of the animated solution line (in cells per frame).
+PATH_SPEED: int = 2
+
+
+def _resolve_icon_path() -> str:
+    """Find the path to the avatar icon within the installed package.
+
+    Uses importlib.resources so that the icon can still be located
+    after the package has been installed in another environment.
+
+    Returns:
+        The file path, or an empty string if it cannot be found.
+    """
+    try:
+        candidate = files("mazegen").joinpath("assets/flash.xpm")
+        path = str(candidate)
+        return path if os.path.isfile(path) else ""
+    except Exception:
+        return ""
+
+
+class AppState:
+    """Manage the MLX window, pixel rendering, and keyboard events.
+
+    Rendering strategy:
+        1. The entire scene is drawn into an MLX image buffer.
+        2. mlx_put_image_to_window displays the buffer in a single call.
+        3. mlx_string_put renders text on top (info bar).
+
+    Keyboard controls:
+        - SPACE   : generates a new maze
+        - P       : shows/hides the shortest path
+        - C       : switches color palette
+        - Q / ESC : exits the program
+    """
+
+    INFO_H: int = 80
+    MAX_CELL: int = 36
+    MIN_CELL: int = 6
+
+    def __init__(self, cfg: Config, mlx: Any) -> None:
+        """Initialize MLX, create the window and the image buffer.
+
+        Args:
+            cfg: validated configuration (size, entrance, exit, ...).
+            mlx: already loaded MLX module instance.
+        """
+        self.cfg = cfg
+        self.mlx: Any = mlx
+
+        self.mlx_ptr: Any = mlx.mlx_init()
+        if not self.mlx_ptr:
+            die("Failed to initialize MLX.")
+
+        _, screen_w, screen_h = mlx.mlx_get_screen_size(self.mlx_ptr)
+
+        # Cell size chosen to best fit the screen, while staying
+        # within the MIN_CELL/MAX_CELL bounds.
+        self.cs: int = max(
+            self.MIN_CELL,
+            min(
+                int(screen_w * 0.9) // cfg.width,
+                (int(screen_h * 0.9) - self.INFO_H) // cfg.height,
+            ),
+        )
+        self.maze_px_w: int = cfg.width * self.cs
+        self.maze_px_h: int = cfg.height * self.cs
+        self.win_w: int = self.maze_px_w
+        self.win_h: int = self.maze_px_h + self.INFO_H
+        self.wall_w: int = max(1, self.cs // 9)
+
+        self.win_ptr: Any = mlx.mlx_new_window(
+            self.mlx_ptr, self.win_w, self.win_h, "A-Maze-ing"
+        )
+        if not self.win_ptr:
+            die("Unable to create MLX window.")
+
+        self.img_ptr: Any = mlx.mlx_new_image(
+            self.mlx_ptr, self.win_w, self.win_h
+        )
+        if not self.img_ptr:
+            die("Unable to create MLX image.")
+        self.data: Any
+        self.sl: int
+        self.data, _bpp, self.sl, _fmt = mlx.mlx_get_data_addr(
+            self.img_ptr
+        )
+
+        self.pal_idx: int = 0
+        self.show_path: bool = False
+        self.solver: Optional[MazeSolver] = None
+        self.needs_redraw: bool = True
+        # Frame counter, incremented on every loop iteration.
+        self.frame: int = 0
+        # Number of path cells already revealed by the animation.
+        self.path_frame: int = 0
+
+        self.gen: MazeGenerator = self._make_gen(cfg.seed)
+        self.spf: int = 50
+
+        self.icon_ptr: Any = None
+        icon_path = _resolve_icon_path()
+        if icon_path:
+            self._load_icon(icon_path)
+
+    def _load_icon(self, icon_path: str) -> None:
+        """Load the XPM icon and resize it to the size of one cell.
+
+        If loading fails for any reason, the avatar is simply
+        disabled (icon_ptr stays None), without crashing.
+
+        Args:
+            icon_path: path of the XPM file to load.
+        """
+        mlx = self.mlx
+        try:
+            orig_res = mlx.mlx_xpm_file_to_image(self.mlx_ptr, icon_path)
+        except Exception:
+            orig_res = None
+
+        if not orig_res or not orig_res[0]:
+            return
+
+        orig_ptr, orig_w, orig_h = orig_res
+        orig_data, _, orig_sl, _ = mlx.mlx_get_data_addr(orig_ptr)
+
+        self.icon_ptr = mlx.mlx_new_image(self.mlx_ptr, self.cs, self.cs)
+        icon_data, _, icon_sl, _ = mlx.mlx_get_data_addr(self.icon_ptr)
+
+        # Nearest-neighbor resizing.
+        for y in range(self.cs):
+            for x in range(self.cs):
+                src_x = int(x * orig_w / self.cs)
+                src_y = int(y * orig_h / self.cs)
+                src_offset = src_y * orig_sl + src_x * 4
+                dest_offset = y * icon_sl + x * 4
+                icon_data[dest_offset:dest_offset + 4] = orig_data[
+                    src_offset:src_offset + 4
+                ]
+
+        mlx.mlx_destroy_image(self.mlx_ptr, orig_ptr)
+
+    def _make_gen(self, seed: Optional[int] = None) -> MazeGenerator:
+        """Create a new generator and reset the display state.
+
+        Args:
+            seed: optional random seed for the new maze.
+
+        Returns:
+            The new MazeGenerator, ready to be animated.
+        """
+        self.show_path = False
+        self.solver = None
+        self.needs_redraw = True
+        self.frame = 0
+        self.path_frame = 0
+        return MazeGenerator(
+            self.cfg.width,
+            self.cfg.height,
+            self.cfg.entry,
+            self.cfg.exit_,
+            seed=seed,
+            perfect=self.cfg.perfect,
+        )
+
+    def _get_solver(self) -> MazeSolver:
+        """Return the solver bound to the current maze (created if needed).
+
+        Returns:
+            The MazeSolver attached to the current generator.
+        """
+        if self.solver is None:
+            self.solver = MazeSolver(self.gen)
+        return self.solver
+
+    @staticmethod
+    def _blend_rgb(
+        c1: tuple[int, int, int],
+        c2: tuple[int, int, int],
+        t: float,
+    ) -> tuple[int, int, int]:
+        """Linearly interpolate between two RGB colors.
+
+        Args:
+            c1: starting color.
+            c2: ending color.
+            t: interpolation factor between 0 (c1) and 1 (c2).
+
+        Returns:
+            The interpolated color.
+        """
+        t = max(0.0, min(1.0, t))
+        return (
+            int(c1[0] + (c2[0] - c1[0]) * t),
+            int(c1[1] + (c2[1] - c1[1]) * t),
+            int(c1[2] + (c2[2] - c1[2]) * t),
+        )
+
+    def _redraw(self) -> None:
+        """Draw the whole scene into the buffer, then display it.
+
+        Handles the cell grid, the walls, the generation animation
+        (trail + pulse), the path animation, the two possible
+        avatars, and the info bar at the bottom of the window.
+        """
+        pal = PALETTES[self.pal_idx]
+        gen = self.gen
+        cs = self.cs
+        ww = self.wall_w
+        sl = self.sl
+        data = self.data
+
+        cb_bg = to_bytes(*pal["bg"])
+        cb_wall = to_bytes(*pal["wall"])
+        cb_visited = to_bytes(*pal["visited"])
+        cb_entry = to_bytes(*pal["entry"])
+        cb_exit = to_bytes(*pal["exit"])
+        cb_pattern = to_bytes(*pal["pattern"])
+        cb_info_bg = to_bytes(*pal["info_bg"])
+
+        fill_rect(data, sl, 0, 0, self.win_w, self.win_h, cb_bg)
+        fill_rect(
+            data, sl, 0, self.maze_px_h, self.win_w, self.INFO_H, cb_info_bg
+        )
+        draw_hline(data, sl, 0, self.maze_px_h, self.win_w, 1, cb_wall)
+
+        # Generation animation state (trail + pulse).
+        trail_map: dict[tuple[int, int], float] = {}
+        depth_t: float = 0.0
+        pulse: float = 1.0
+
+        if not gen.done and gen._stack:
+            trail_slice = gen._stack[-TRAIL_LEN:]
+            n = len(trail_slice)
+            for i, cell in enumerate(trail_slice):
+                trail_map[cell] = (i + 1) / n
+
+            half = max(1, (gen.width * gen.height) // 2)
+            depth_t = min(1.0, len(gen._stack) / half)
+            pulse = 0.65 + 0.35 * math.sin(self.frame * 0.18)
+
+        # Solution path animation state.
+        plist: list[tuple[int, int]] = []
+        n_shown: int = 0
+        path_head: Optional[tuple[int, int]] = None
+
+        if gen.done and self.show_path:
+            plist = self._get_solver().path_list()
+            n_shown = min(len(plist), self.path_frame)
+            if n_shown > 0:
+                path_head = plist[n_shown - 1]
+
+        # Draw each cell and its walls.
+        for row in range(gen.height):
+            for col in range(gen.width):
+                px = col * cs
+                py = row * cs
+                pos = (col, row)
+
+                if gen.is_42[row][col]:
+                    cb_fill = cb_pattern
+                elif pos == gen.current:
+                    pulsed = self._blend_rgb(
+                        pal["current"], (255, 255, 255), pulse * 0.75
+                    )
+                    cb_fill = to_bytes(*pulsed)
+                elif pos in trail_map:
+                    t = trail_map[pos]
+                    trail_col = self._blend_rgb(
+                        pal["visited"], pal["current"], t * 0.4
+                    )
+                    trail_col = self._blend_rgb(
+                        trail_col, _WARM, depth_t * t * 0.85
+                    )
+                    cb_fill = to_bytes(*trail_col)
+                elif pos == gen.entry:
+                    cb_fill = cb_entry
+                elif pos == gen.exit_:
+                    cb_fill = cb_exit
+                elif gen.visited[row][col]:
+                    cb_fill = cb_visited
+                else:
+                    cb_fill = cb_bg
+
+                fill_rect(data, sl, px, py, cs, cs, cb_fill)
+
+                walls = gen.grid[row][col]
+                if walls & NORTH:
+                    draw_hline(data, sl, px, py, cs, ww, cb_wall)
+                if walls & EAST:
+                    draw_vline(
+                        data, sl, px + cs - ww, py, cs, ww, cb_wall
+                    )
+                if walls & SOUTH:
+                    draw_hline(
+                        data, sl, px, py + cs - ww, cs, ww, cb_wall
+                    )
+                if walls & WEST:
+                    draw_vline(data, sl, px, py, cs, ww, cb_wall)
+
+        # Animated solution line.
+        if n_shown > 0:
+            line_w = max(2, cs // 4)
+            cb_line = to_bytes(*pal["path"])
+
+            for i in range(n_shown - 1):
+                (cx1, cy1) = plist[i]
+                (cx2, cy2) = plist[i + 1]
+
+                px1 = cx1 * cs + cs // 2
+                py1 = cy1 * cs + cs // 2
+                px2 = cx2 * cs + cs // 2
+                py2 = cy2 * cs + cs // 2
+
+                if cy1 == cy2:
+                    x0 = min(px1, px2)
+                    draw_hline(
+                        data, sl, x0, py1 - line_w // 2, cs, line_w, cb_line
+                    )
+                else:
+                    y0 = min(py1, py2)
+                    draw_vline(
+                        data, sl, px1 - line_w // 2, y0, cs, line_w, cb_line
+                    )
+
+            if path_head is not None:
+                hx, hy = path_head
+                tip_w = max(line_w + 4, cs // 2)
+                tip_x = hx * cs + cs // 2 - tip_w // 2
+                tip_y = hy * cs + cs // 2 - tip_w // 2
+                glow = self._blend_rgb(pal["path"], (255, 255, 255), 0.8)
+                fill_rect(
+                    data, sl, tip_x, tip_y, tip_w, tip_w, to_bytes(*glow)
+                )
+
+        self.mlx.mlx_put_image_to_window(
+            self.mlx_ptr, self.win_ptr, self.img_ptr, 0, 0
+        )
+
+        if not gen.done and self.icon_ptr and gen.current:
+            head_x = gen.current[0] * cs
+            head_y = gen.current[1] * cs
+            self.mlx.mlx_put_image_to_window(
+                self.mlx_ptr, self.win_ptr, self.icon_ptr, head_x, head_y
+            )
+
+        # Avatar position: follows the path if shown, otherwise the
+        # generation head, otherwise the exit.
+        if gen.done and self.show_path and path_head is not None:
+            avatar_pos = path_head
+        else:
+            avatar_pos = gen.current if gen.current else gen.exit_
+
+        if self.icon_ptr and avatar_pos:
+            head_x = avatar_pos[0] * cs
+            head_y = avatar_pos[1] * cs
+            self.mlx.mlx_put_image_to_window(
+                self.mlx_ptr, self.win_ptr, self.icon_ptr, head_x, head_y
+            )
+
+        # Info bar: generation or resolution status.
+        wc = to_int(*pal["wall"])
+        hc = to_int(*pal["hint"])
+        ty = self.maze_px_h + 10
+
+        if gen.done:
+            path_len = len(self._get_solver().solve())
+            if self.show_path:
+                traced = min(self.path_frame, len(plist))
+                status = (
+                    f"Finished  seed={gen.seed}         "
+                    f"path={path_len} steps  "
+                    f"tracing {traced}/{len(plist)}"
+                )
+            else:
+                status = (
+                    f"Finished  seed={gen.seed}         "
+                    f"path={path_len} steps"
+                )
+        else:
+            done_cells = sum(
+                gen.visited[r][c]
+                for r in range(gen.height)
+                for c in range(gen.width)
+            )
+            pct = done_cells * 100 // (gen.width * gen.height)
+            status = f"Generating {pct}%     seed={gen.seed}"
+
+        self.mlx.mlx_string_put(
+            self.mlx_ptr, self.win_ptr, 8, ty, wc, status
+        )
+        self.mlx.mlx_string_put(
+            self.mlx_ptr,
+            self.win_ptr,
+            8,
+            ty + 22,
+            hc,
+            "SPACE=regen      P=path      C=color      Q=quit",
+        )
+
+    def on_key(self, keycode: int, _param: object) -> None:
+        """Handle keyboard events.
+
+        Args:
+            keycode: X11 code of the pressed key.
+            _param: parameter passed by MLX (unused).
+        """
+        if keycode in (KEY_Q, KEY_ESCAPE):
+            self.mlx.mlx_loop_exit(self.mlx_ptr)
+        elif keycode == KEY_SPACE:
+            self.gen = self._make_gen()
+        elif keycode == KEY_P:
+            if self.gen.done:
+                self.show_path = not self.show_path
+                self.path_frame = 0
+                self.needs_redraw = True
+        elif keycode == KEY_C:
+            self.pal_idx = (self.pal_idx + 1) % len(PALETTES)
+            self.needs_redraw = True
+
+    def on_loop(self, _param: object) -> None:
+        """Call on every iteration of the MLX loop.
+
+        Advances the generation or the path animation, then redraws
+        the scene if necessary.
+        """
+        if not self.gen.done:
+            self.gen.step(self.spf)
+            self.frame += 1
+            self.needs_redraw = True
+            if self.gen.done:
+                solver = self._get_solver()
+                write_output(
+                    self.gen, solver.solve(), self.cfg.output_file
+                )
+        elif self.show_path:
+            plist = self._get_solver().path_list()
+            if self.path_frame < len(plist):
+                self.path_frame += PATH_SPEED
+                self.needs_redraw = True
+
+        if self.needs_redraw:
+            self._redraw()
+            self.needs_redraw = False
+
+    def on_expose(self, _param: object) -> None:
+        """Force a redraw when the window is re-exposed."""
+        self.needs_redraw = True
+
+    def on_close(self, _param: object) -> None:
+        """Handle a click on the window's close button."""
+        self.mlx.mlx_loop_exit(self.mlx_ptr)
+
+    def run(self) -> None:
+        """Register the MLX hooks and start the main loop."""
+        self.mlx.mlx_key_hook(self.win_ptr, self.on_key, None)
+        self.mlx.mlx_loop_hook(self.mlx_ptr, self.on_loop, None)
+        self.mlx.mlx_expose_hook(self.win_ptr, self.on_expose, None)
+        self.mlx.mlx_hook(self.win_ptr, 33, 0, self.on_close, None)
+
+        self.mlx.mlx_loop(self.mlx_ptr)
+
+        self.mlx.mlx_destroy_image(self.mlx_ptr, self.img_ptr)
+        self.mlx.mlx_destroy_window(self.mlx_ptr, self.win_ptr)
+        self.mlx.mlx_release(self.mlx_ptr)
